@@ -11,13 +11,8 @@ from plotly.subplots import make_subplots
 from rasterio.io import MemoryFile
 import matplotlib.pyplot as plt
 from concurrent.futures import ThreadPoolExecutor
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_squared_error
-import joblib
 import os
 from dotenv import load_dotenv
-import openai
 from openai import OpenAI
 
 load_dotenv()
@@ -28,7 +23,6 @@ st.set_page_config(layout="wide", page_title="SmartTown: Urban Planning Tool - P
 # Securely store API keys
 OPENTOPOGRAPHY_API_KEY = os.getenv("OPENTOPOGRAPHY_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-openai.api_key = OPENAI_API_KEY
 
 # Define all available parameters
 ALL_PARAMETERS = {
@@ -144,8 +138,15 @@ def create_climate_visualizations(nasa_data):
             st.subheader(ALL_PARAMETERS[param])
             st.line_chart(nasa_data[param])
 
+    st.download_button(
+        label="Download Climate Data as CSV",
+        data=nasa_data.to_csv(),
+        file_name="climate_data.csv",
+        mime="text/csv"
+    )
+
     st.subheader("Climate Parameter Correlation Heatmap")
-    corr = nasa_data.corr()
+    corr = nasa_data.corr(numeric_only=True)
     fig_heatmap = go.Figure(data=go.Heatmap(
                    z=corr.values,
                    x=corr.columns,
@@ -181,7 +182,7 @@ def analyze_topography(elevation_data):
 
     st.pyplot(fig)
 
-       # Calculate insights
+    # Calculate insights
     avg_elevation = np.mean(elevation_data)
     avg_slope = np.mean(slope)
 
@@ -196,7 +197,7 @@ def analyze_topography(elevation_data):
     moderate = np.sum((slope >= 15) & (slope < 30)) / slope.size * 100
     steep = np.sum(slope >= 30) / slope.size * 100
 
-        # Save data to session state
+    # Save data to session state
     st.session_state['topography_analysis'] = {
         'average_elevation': avg_elevation,
         'average_slope': avg_slope,
@@ -249,185 +250,128 @@ def evaluate_land_suitability(nasa_data, elevation_data, weights=None, ideal_val
     if ideal_values is None:
         ideal_values = {'temp': 30, 'precip': 1.5, 'solar': 300, 'slope': 30}
     
-    temp_suitability = 1 - np.abs(nasa_data['T2M'].mean() - ideal_values['temp']) / 30
-    
-    precip_suitability = 1 - np.abs(nasa_data['PRECTOTCORR'].mean() - ideal_values['precip']) / 1.5
-    
-    solar_suitability = np.minimum(nasa_data['ALLSKY_SFC_SW_DWN'].mean() / ideal_values['solar'], 1)
-    
+    temp_suitability = np.clip(1 - np.abs(nasa_data['T2M'].mean() - ideal_values['temp']) / 30, 0, 1)
+
+    precip_suitability = np.clip(1 - np.abs(nasa_data['PRECTOTCORR'].mean() - ideal_values['precip']) / 1.5, 0, 1)
+
+    solar_suitability = np.clip(nasa_data['ALLSKY_SFC_SW_DWN'].mean() / ideal_values['solar'], 0, 1)
+
     dy, dx = np.gradient(elevation_data)
     slope = np.degrees(np.arctan(np.sqrt(dx*dx + dy*dy)))
     slope_suitability = 1 / (1 + np.exp((slope - ideal_values['slope']) / 10))
-    
-    suitability_score = (
+
+    suitability_score = np.clip(
         temp_suitability * weights['temp'] +
         precip_suitability * weights['precip'] +
         solar_suitability * weights['solar'] +
-        slope_suitability * weights['slope']
+        slope_suitability * weights['slope'],
+        0, 1
     )
-    
+
     return suitability_score
 
-def urban_planning_chatbot(nasa_data, elevation_data, user_input, coordinates,topography_analysis):
-    # Prepare a summary of the data for the chatbot
+def get_topography_summary(elevation_data):
+    dy, dx = np.gradient(elevation_data)
+    slope = np.degrees(np.arctan(np.sqrt(dx*dx + dy*dy)))
+    avg_elevation = np.mean(elevation_data)
+    avg_slope = np.mean(slope)
+    flat = np.sum((slope >= 0) & (slope < 5)) / slope.size * 100
+    gentle = np.sum((slope >= 5) & (slope < 15)) / slope.size * 100
+    moderate = np.sum((slope >= 15) & (slope < 30)) / slope.size * 100
+    steep = np.sum(slope >= 30) / slope.size * 100
+    return {
+        'average_elevation': avg_elevation,
+        'average_slope': avg_slope,
+        'slope_classification': {
+            'flat': flat, 'gentle': gentle, 'moderate': moderate, 'steep': steep
+        }
+    }
+
+def urban_planning_chatbot(nasa_data, elevation_data, user_input, coordinates):
     avg_temp = nasa_data['T2M'].mean() if 'T2M' in nasa_data.columns else "N/A"
     avg_precip = nasa_data['PRECTOTCORR'].mean() if 'PRECTOTCORR' in nasa_data.columns else "N/A"
     avg_solar = nasa_data['ALLSKY_SFC_SW_DWN'].mean() if 'ALLSKY_SFC_SW_DWN' in nasa_data.columns else "N/A"
     avg_elevation = np.mean(elevation_data)
-    
-    # Calculate centroid of the selected area
     lat, lon = calculate_centroid(coordinates)
 
-    # Prepare the conversation context
-    conversation = [
-        {"role": "system", 
-         "content": """
-        I am an advanced AI urban planning assistant with expertise in sustainable development, climate-responsive design, and data-driven decision making. I have access to detailed climate and topographical data for a specific area. My role is to provide insightful, practical, and tailored urban planning recommendations based on this data and best practices in urban design.
-        Available Data:
+    topo = get_topography_summary(elevation_data)
+    slope_info = topo['slope_classification']
 
-        Coordinates: {coordinates}
-        Lat {lat:.4f}, Lon {lon:.4f}
-        Climate Data:
+    additional_params = []
+    for param in nasa_data.columns:
+        if param not in ['T2M', 'PRECTOTCORR', 'ALLSKY_SFC_SW_DWN']:
+            additional_params.append(f"{ALL_PARAMETERS.get(param, param)}: {nasa_data[param].mean():.2f}")
+    additional_climate_str = "\n        ".join(additional_params) if additional_params else "None"
 
+    system_content = f"""You are an advanced AI urban planning assistant with expertise in sustainable development, climate-responsive design, and data-driven decision making.
+
+Available Data:
+    Coordinates: Lat {lat:.4f}, Lon {lon:.4f}
+
+    Climate Data:
         Average Temperature: {avg_temp:.2f}°C
         Average Precipitation: {avg_precip:.2f} mm/day
         Average Solar Radiation: {avg_solar:.2f} W/m^2
-        {additional_climate_params}
+        {additional_climate_str}
 
-
-        Topographical Data:
-
+    Topographical Data:
         Average Elevation: {avg_elevation:.2f} meters
-        Slope characteristics: {slope_chars}
-        Topography Insights: {topography_analysis}
+        Average Slope: {topo['average_slope']:.2f} degrees
+        Flat (0-5°): {slope_info['flat']:.1f}%
+        Gentle (5-15°): {slope_info['gentle']:.1f}%
+        Moderate (15-30°): {slope_info['moderate']:.1f}%
+        Steep (>30°): {slope_info['steep']:.1f}%
 
-        Land Suitability Score: {land_suitability:.2f}/1.00
+Your Capabilities:
+    - Analyze the provided data to assess the area's potential for urban development
+    - Suggest sustainable urban planning strategies aligned with local climate and topography
+    - Recommend optimal building designs, orientations, and ventilation facing
+    - Advise on energy-efficient infrastructure, water management, green spaces, transportation, and climate adaptation
+    - Identify challenges and suggest mitigation strategies
 
-        My Capabilities:
+Response Guidelines:
+    - Structure responses clearly with headings and bullet points
+    - Provide specific, actionable recommendations referencing the data
+    - Explain reasoning behind suggestions
+    - State assumptions and limitations clearly"""
 
-        Analyze the provided data to assess the area's potential for various urban development projects.
-        Suggest sustainable urban planning strategies that align with the local climate and topography.
-        Provide recommendations on:
-
-        Optimal building designs and orientations.
-        facing of buildings for ventilations
-        Energy-efficient infrastructure
-        Water management systems
-        Green spaces and urban forestry
-        Transportation network planning
-        Climate change adaptation measures
-
-
-        Identify potential challenges or limitations based on the data and suggest mitigation strategies.
-        Offer insights on how to balance development needs with environmental conservation.
-
-        My Response Guidelines:
-
-        I structure my responses clearly, using headings or bullet points where appropriate.
-        I provide specific, actionable recommendations based on the data provided.
-        I explain the reasoning behind my suggestions, referencing the climate and topographical data.
-        When relevant, I mention any assumptions I'm making or additional data that would be helpful.
-        If asked about topics outside my expertise or data scope, I clearly state the limitations of my knowledge.
-        I encourage sustainable and resilient urban planning practices in all my recommendations.
-
-        My goal is to assist urban planners in making informed, data-driven decisions that promote sustainable and livable urban environments. I tailor my responses to the specific context provided in each query also gave specified Answer.
-        """
-         },
-        {"role": "user", "content": f"Here's a summary of the area data:\n Lat {lat:.4f}, Lon {lon:.4f}\nAverage Temperature: {avg_temp:.2f}°C\nAverage Precipitation: {avg_precip:.2f} mm/day\nAverage Solar Radiation: {avg_solar:.2f} W/m^2\nAverage Elevation: {avg_elevation:.2f} meters\n\nBased on this data and location, {user_input}"}
+    conversation = [
+        {"role": "system", "content": system_content},
+        {"role": "user", "content": f"Based on the area data (Lat {lat:.4f}, Lon {lon:.4f}, Avg Temp: {avg_temp:.2f}°C, Avg Precip: {avg_precip:.2f} mm/day, Avg Solar: {avg_solar:.2f} W/m², Avg Elevation: {avg_elevation:.2f}m), {user_input}"}
     ]
-    
+
     try:
         client = OpenAI()
         response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
+            model="gpt-4o-mini",
             messages=conversation
         )
-        ai_message = response.choices[0].message.content
-        
-        return ai_message
+        return response.choices[0].message.content
     except Exception as e:
         return f"An error occurred: {str(e)}"
-    
-
-# def display_chat_history():
-#     st.markdown("### Chat History")
-#     if 'chat_history' in st.session_state and st.session_state.chat_history:
-#         for message in st.session_state.chat_history:
-#             if message['is_user']:
-#                 st.markdown(f"**You:** {message['content']}")
-#             else:
-#                 st.markdown(f"**AI:** {message['content']}")
-#     else:
-#         st.markdown("No conversation history yet.")
 
 def create_chat_interface():
-    # Chat input form
-    user_input = st.text_input("Enter your urban planning query...", key="user_input")
-    submit_button = st.button(label="Submit Query")
+    # Display chat history using st.chat_message
+    for message in st.session_state.chat_history:
+        role = "user" if message['is_user'] else "assistant"
+        with st.chat_message(role):
+            st.markdown(message['content'])
 
-    if submit_button and user_input:
-        send_message(user_input)
+    if user_input := st.chat_input("Enter your urban planning query..."):
+        st.session_state.chat_history.append({"is_user": True, "content": user_input})
+        with st.chat_message("user"):
+            st.markdown(user_input)
 
-    # Custom CSS for modern and minimalistic chat bubbles
-    st.markdown("""
-    <style>
-    .chat-container {
-        display: flex;
-        flex-direction: column;
-        gap: 10px;
-    }
-    .chat-bubble {
-        padding: 12px 16px;
-        border-radius: 18px;
-        max-width: 80%;
-        line-height: 1.4;
-        font-size: 16px;
-    }
-    .user-bubble {
-        align-self: flex-start;
-        background-color: #f0f0f0;
-        color: #333;
-    }
-    .ai-bubble {
-        align-self: flex-start;
-        background-color: #e1f5fe;
-        color: #0277bd;
-    }
-    .message-container {
-        display: flex;
-        flex-direction: column;
-    }
-    .timestamp {
-        font-size: 12px;
-        color: #888;
-        margin-top: 4px;
-    }
-    </style>
-    """, unsafe_allow_html=True)
-
-    # Display chat history
-    st.markdown("### Chat History")
-    if 'chat_history' in st.session_state and st.session_state.chat_history:
-        st.markdown('<div class="chat-container">', unsafe_allow_html=True)
-        for message in st.session_state.chat_history:
-            bubble_class = "user-bubble" if message['is_user'] else "ai-bubble"
-            sender = "You" if message['is_user'] else "AI"
-            st.markdown(f"""
-            <div class="message-container" style="align-items: {'flex-end' if message['is_user'] else 'flex-start'}">
-                <div class="chat-bubble {bubble_class}">{message['content']}</div>
-                <div class="timestamp">{sender} • Just now</div>
-            </div>
-            """, unsafe_allow_html=True)
-        st.markdown('</div>', unsafe_allow_html=True)
-    else:
-        st.markdown("No conversation history yet.")
-
-
-def send_message(user_input):
-    with st.spinner("AI is thinking..."):
-        ai_response = urban_planning_chatbot(st.session_state.nasa_data, st.session_state.elevation_data, user_input, st.session_state.coordinates,st.session_state['topography_analysis'])
-    st.session_state.chat_history.insert(0,{"is_user": False, "content": ai_response})
-    st.session_state.chat_history.insert(0,{"is_user": True, "content": user_input})
+        with st.chat_message("assistant"):
+            with st.spinner("AI is thinking..."):
+                ai_response = urban_planning_chatbot(
+                    st.session_state.nasa_data,
+                    st.session_state.elevation_data,
+                    user_input,
+                    st.session_state.coordinates
+                )
+            st.markdown(ai_response)
+        st.session_state.chat_history.append({"is_user": False, "content": ai_response})
 
 
 # Function to display the welcome page
@@ -657,6 +601,11 @@ def main():
                 south, west = min(coord[1] for coord in coordinates[0]), min(coord[0] for coord in coordinates[0])
                 north, east = max(coord[1] for coord in coordinates[0]), max(coord[0] for coord in coordinates[0])
 
+                area_deg = (north - south) * (east - west)
+                if area_deg > 1.0:
+                    st.error("Selected area is too large (max ~1 degree x 1 degree / ~110km x 110km). Please select a smaller area to avoid API timeouts.")
+                    st.stop()
+
                 progress_bar = st.progress(0)
                 
                 with st.spinner("Fetching and analyzing data..."):
@@ -707,11 +656,18 @@ def main():
                 ideal_solar = st.slider("Ideal Solar Radiation (W/m^2)", 0, 500, 300, 10)
                 ideal_slope = st.slider("Ideal Slope (%)", 0, 45, 30)
 
+            weight_sum = weight_temp + weight_precip + weight_solar + weight_slope
+            if weight_sum == 0:
+                st.error("At least one weight must be greater than 0.")
+                return
+            if abs(weight_sum - 1.0) > 0.01:
+                st.warning(f"Weights sum to {weight_sum:.2f}. They will be normalized to sum to 1.")
+
             weights = {
-                'temp': weight_temp,
-                'precip': weight_precip,
-                'solar': weight_solar,
-                'slope': weight_slope
+                'temp': weight_temp / weight_sum,
+                'precip': weight_precip / weight_sum,
+                'solar': weight_solar / weight_sum,
+                'slope': weight_slope / weight_sum
             }
             ideal_values = {
                 'temp': ideal_temp,
@@ -733,10 +689,17 @@ def main():
             avg_suitability = np.mean(suitability_score)
             st.metric("Average Land Suitability Score", f"{avg_suitability:.2f}/1.00")
 
+            suitability_df = pd.DataFrame(suitability_score)
+            st.download_button(
+                label="Download Suitability Data as CSV",
+                data=suitability_df.to_csv(index=False),
+                file_name="land_suitability.csv",
+                mime="text/csv"
+            )
+
         with tab4:
             st.header("Urban Planning Assistant")
             st.markdown("Discuss your urban planning queries and receive expert advice.")
-            # display_chat_history()
             create_chat_interface()
                                                 
     else:
