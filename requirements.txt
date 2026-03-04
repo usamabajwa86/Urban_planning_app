@@ -1,0 +1,16 @@
+streamlit
+folium
+streamlit-folium
+requests
+pandas
+numpy
+plotly
+rasterio
+geopandas
+matplotlib
+seaborn
+scikit-learn
+pythreejs
+ipywidgets
+python-dotenv
+openai
